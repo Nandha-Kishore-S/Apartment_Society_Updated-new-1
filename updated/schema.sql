@@ -1,9 +1,8 @@
 CREATE DATABASE IF NOT EXISTS apartment_society;
 USE apartment_society;
 
--- Required tables for this revised version.
--- Back up an existing database before changing its structure.
--- CREATE TABLE IF NOT EXISTS does not alter columns in an older table.
+-- For a fresh database, run this file as-is.
+-- For an existing database, see the migration commands in README.txt.
 
 CREATE TABLE IF NOT EXISTS Apartment (
     apartment_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -15,13 +14,14 @@ CREATE TABLE IF NOT EXISTS Apartment (
 CREATE TABLE IF NOT EXISTS Resident (
     resident_id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(80) NOT NULL,
-    phone VARCHAR(15) NOT NULL,
+    phone VARCHAR(10) NOT NULL,
     email VARCHAR(120) NOT NULL,
-    apartment_id INT NOT NULL,
+    apartment_id INT NOT NULL UNIQUE,
     CONSTRAINT fk_resident_apartment FOREIGN KEY (apartment_id)
         REFERENCES Apartment(apartment_id)
 );
 
+-- Multiple payment rows for the same resident/month are allowed for installments.
 CREATE TABLE IF NOT EXISTS MaintenancePayment (
     payment_id INT AUTO_INCREMENT PRIMARY KEY,
     resident_id INT NOT NULL,
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS MaintenancePayment (
     amount DECIMAL(10,2) NOT NULL CHECK (amount > 0),
     payment_date DATE NOT NULL,
     status ENUM('PAID') NOT NULL DEFAULT 'PAID',
-    CONSTRAINT uq_resident_payment_month UNIQUE (resident_id, payment_month),
     CONSTRAINT fk_payment_resident FOREIGN KEY (resident_id)
         REFERENCES Resident(resident_id) ON DELETE CASCADE
 );

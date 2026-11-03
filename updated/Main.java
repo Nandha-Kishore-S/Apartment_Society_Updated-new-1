@@ -133,8 +133,9 @@ public class Main {
                         case "8" -> resolveComplaint();
                         case "9" -> collectionReport();
                         case "10" -> removeResident();
+                        case "11" -> updateResident();
                         case "0" -> { running = false; System.out.println("Goodbye!"); }
-                        default -> System.out.println("Invalid choice. Enter a number from 0 to 10.");
+                        default -> System.out.println("Invalid choice. Enter a number from 0 to 11.");
                     }
                 } catch (InvalidInputException | RecordNotFoundException e) {
                     System.out.println("Error: " + e.getMessage());
@@ -163,7 +164,7 @@ public class Main {
         System.out.println("1. Register Resident\n2. View Apartments\n3. View Residents");
         System.out.println("4. Record Maintenance Payment\n5. View Pending Payments");
         System.out.println("6. Register Complaint\n7. View Complaints\n8. Resolve Complaint");
-        System.out.println("9. Monthly Collection Report\n10. Remove Resident\n0. Exit");
+        System.out.println("9. Monthly Collection Report\n10. Remove Resident\n11. Update Resident Details\n0. Exit");
         System.out.println("==================================================");
     }
 
@@ -197,20 +198,27 @@ public class Main {
     }
     private static String readEmail() throws InvalidInputException {
         String email = readRequired("Email: ");
-        if (!Pattern.matches("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", email))
+        // Accept commonly used domain extensions; this rejects mistyped extensions such as .cojm.
+        if (!Pattern.matches("^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.(com|org|net|edu|gov|in|co\\.in|ac\\.in)$", email))
             throw new InvalidInputException("Invalid email. Example: name@example.com");
         return email;
     }
     private static String readPhone() throws InvalidInputException {
         String phone = readRequired("Phone number: ");
-        if (!phone.matches("[0-9]{7,15}"))
-            throw new InvalidInputException("Phone number must contain 7 to 15 digits only.");
+        if (!phone.matches("[0-9]{10}"))
+            throw new InvalidInputException("Phone number must contain exactly 10 digits.");
         return phone;
     }
     private static String readMonth() throws InvalidInputException {
         String month = readRequired("Month (YYYY-MM): ");
-        try { YearMonth.parse(month); return month; }
-        catch (Exception e) { throw new InvalidInputException("Invalid month. Use YYYY-MM, for example 2026-11."); }
+        try {
+            YearMonth enteredMonth = YearMonth.parse(month);
+            if (enteredMonth.isAfter(YearMonth.now()))
+                throw new InvalidInputException("Payment month cannot be greater than the current month.");
+            return month;
+        } catch (java.time.format.DateTimeParseException e) {
+            throw new InvalidInputException("Invalid month. Use YYYY-MM, for example 2026-11.");
+        }
     }
     private static void checkResident(int id) throws SQLException, RecordNotFoundException {
         try (PreparedStatement ps = con.prepareStatement("SELECT resident_id FROM Resident WHERE resident_id=?")) {
@@ -234,6 +242,12 @@ public class Main {
             ps.setInt(1, apartmentId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) throw new RecordNotFoundException("Apartment ID " + apartmentId + " was not found.");
+            }
+        }
+        try (PreparedStatement ps = con.prepareStatement("SELECT resident_id FROM Resident WHERE apartment_id=?")) {
+            ps.setInt(1, apartmentId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) throw new InvalidInputException("This apartment is already occupied. Choose another apartment.");
             }
         }
         String sql = "INSERT INTO Resident(name,phone,email,apartment_id) VALUES(?,?,?,?)";
@@ -281,42 +295,85 @@ public class Main {
         }
     }
 
-    // 4. Record maintenance payment
+    // 4. Record maintenance payment. Multiple installments are allowed for a month.
     private static void recordPayment() throws SQLException, InvalidInputException, RecordNotFoundException {
         System.out.println("--- Record Maintenance Payment ---");
         int residentId = readPositiveInt("Resident ID: ");
         checkResident(residentId);
         String month = readMonth();
-        BigDecimal amount = readAmount("Amount paid: Rs. ");
+
+        BigDecimal maintenanceDue;
+        String dueSql = "SELECT a.monthly_maintenance FROM Resident r JOIN Apartment a " +
+                "ON r.apartment_id=a.apartment_id WHERE r.resident_id=?";
+        try (PreparedStatement ps = con.prepareStatement(dueSql)) {
+            ps.setInt(1, residentId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) throw new RecordNotFoundException("Resident ID " + residentId + " does not exist.");
+                maintenanceDue = rs.getBigDecimal("monthly_maintenance");
+            }
+        }
+
+        BigDecimal alreadyPaid = BigDecimal.ZERO;
+        String paidSql = "SELECT COALESCE(SUM(amount),0) AS total_paid FROM MaintenancePayment " +
+                "WHERE resident_id=? AND payment_month=? AND status='PAID'";
+        try (PreparedStatement ps = con.prepareStatement(paidSql)) {
+            ps.setInt(1, residentId);
+            ps.setString(2, month);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) alreadyPaid = rs.getBigDecimal("total_paid");
+            }
+        }
+
+        BigDecimal remaining = maintenanceDue.subtract(alreadyPaid);
+        if (remaining.compareTo(BigDecimal.ZERO) <= 0)
+            throw new InvalidInputException("Maintenance payment for " + month + " is already complete.");
+
+        System.out.println("Monthly maintenance: Rs. " + maintenanceDue);
+        System.out.println("Already paid: Rs. " + alreadyPaid);
+        System.out.println("Remaining amount: Rs. " + remaining);
+        BigDecimal amount = readAmount("Amount to pay now: Rs. ");
+        if (amount.compareTo(remaining) > 0)
+            throw new InvalidInputException("Amount exceeds the remaining balance of Rs. " + remaining);
+
         String sql = "INSERT INTO MaintenancePayment(resident_id,payment_month,amount,payment_date,status) VALUES(?,?,?,CURRENT_DATE,'PAID')";
         try (PreparedStatement ps = con.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setInt(1, residentId); ps.setString(2, month); ps.setBigDecimal(3, amount);
+            ps.setInt(1, residentId);
+            ps.setString(2, month);
+            ps.setBigDecimal(3, amount);
             ps.executeUpdate();
             try (ResultSet keys = ps.getGeneratedKeys()) {
-                if (keys.next()) {
-                    MaintenancePayment p = new MaintenancePayment(keys.getInt(1), residentId, month, amount);
-                    System.out.println("Payment saved. Payment ID: " + p.getId() + ", Month: " + p.getMonth() + ", Amount: Rs. " + p.getAmount());
-                } else System.out.println("Payment recorded successfully.");
+                if (keys.next()) System.out.println("Payment transaction saved. Payment ID: " + keys.getInt(1));
             }
-        } catch (SQLIntegrityConstraintViolationException e) {
-            throw new InvalidInputException("A payment for this resident and month already exists.");
+        }
+
+        BigDecimal totalPaid = alreadyPaid.add(amount);
+        BigDecimal balance = maintenanceDue.subtract(totalPaid);
+        if (balance.compareTo(BigDecimal.ZERO) == 0) {
+            System.out.println("PAYMENT COMPLETE for " + month + ". Total paid: Rs. " + totalPaid);
+        } else {
+            System.out.println("Partial payment recorded. Total paid: Rs. " + totalPaid);
+            System.out.println("Remaining amount: Rs. " + balance);
         }
     }
 
-    // 5. Pending payments for the current month
+    // 5. Pending payments show only the outstanding balance after installments.
     private static void pendingPayments() throws SQLException {
-        String sql = "SELECT r.resident_id,r.name,a.flat_number,a.monthly_maintenance " +
+        String sql = "SELECT r.resident_id,r.name,a.flat_number,a.monthly_maintenance - " +
+                "COALESCE((SELECT SUM(p.amount) FROM MaintenancePayment p " +
+                "WHERE p.resident_id=r.resident_id AND p.payment_month=DATE_FORMAT(CURRENT_DATE,'%Y-%m') " +
+                "AND p.status='PAID'),0) AS remaining_amount " +
                 "FROM Resident r JOIN Apartment a ON r.apartment_id=a.apartment_id " +
-                "WHERE NOT EXISTS (SELECT 1 FROM MaintenancePayment p WHERE p.resident_id=r.resident_id " +
-                "AND p.payment_month=DATE_FORMAT(CURRENT_DATE,'%Y-%m') AND p.status='PAID') ORDER BY r.resident_id";
+                "WHERE a.monthly_maintenance > COALESCE((SELECT SUM(p.amount) FROM MaintenancePayment p " +
+                "WHERE p.resident_id=r.resident_id AND p.payment_month=DATE_FORMAT(CURRENT_DATE,'%Y-%m') " +
+                "AND p.status='PAID'),0) ORDER BY r.resident_id";
         try (Statement st = con.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             System.out.println("Pending payments for " + YearMonth.now());
-            System.out.printf("%-8s %-20s %-12s %-18s%n", "ID", "Resident", "Flat", "Amount Due");
+            System.out.printf("%-8s %-20s %-12s %-18s%n", "ID", "Resident", "Flat", "Remaining Due");
             boolean found = false;
             while (rs.next()) {
                 found = true;
                 System.out.printf("%-8d %-20s %-12s Rs. %-14s%n", rs.getInt("resident_id"),
-                        rs.getString("name"), rs.getString("flat_number"), rs.getBigDecimal("monthly_maintenance"));
+                        rs.getString("name"), rs.getString("flat_number"), rs.getBigDecimal("remaining_amount"));
             }
             if (!found) System.out.println("No pending payments for this month.");
         }
@@ -434,6 +491,89 @@ public class Main {
                 .map(MonthlyCollection::getTotal)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         System.out.println("Grand total collected: Rs. " + grandTotal);
+    }
+
+    // 11. Update one resident detail after displaying the current details.
+    private static void updateResident() throws SQLException, InvalidInputException, RecordNotFoundException {
+        System.out.println("--- Update Resident Details ---");
+        int id = readPositiveInt("Resident ID: ");
+
+        String currentSql = "SELECT r.name,r.phone,r.email,r.apartment_id,a.flat_number " +
+                "FROM Resident r JOIN Apartment a ON r.apartment_id=a.apartment_id WHERE r.resident_id=?";
+        try (PreparedStatement ps = con.prepareStatement(currentSql)) {
+            ps.setInt(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) throw new RecordNotFoundException("Resident ID " + id + " does not exist.");
+                System.out.println("\nCurrent resident details:");
+                System.out.println("Name: " + rs.getString("name"));
+                System.out.println("Phone: " + rs.getString("phone"));
+                System.out.println("Email: " + rs.getString("email"));
+                System.out.println("Apartment ID: " + rs.getInt("apartment_id"));
+                System.out.println("Flat: " + rs.getString("flat_number"));
+            }
+        }
+
+        System.out.println("\nWhat would you like to update?");
+        System.out.println("1. Name\n2. Phone number\n3. Email address\n4. Apartment / Flat");
+        String choice = readRequired("Choose an option (1-4): ");
+
+        String sql;
+        try (PreparedStatement ps = switch (choice) {
+            case "1" -> {
+                String name = readRequired("New name: ");
+                if (!name.matches("[\\p{L} .'-]{2,80}"))
+                    throw new InvalidInputException("Enter a valid name (2-80 characters).");
+                sql = "UPDATE Resident SET name=? WHERE resident_id=?";
+                PreparedStatement update = con.prepareStatement(sql);
+                update.setString(1, name);
+                update.setInt(2, id);
+                yield update;
+            }
+            case "2" -> {
+                String phone = readPhone();
+                sql = "UPDATE Resident SET phone=? WHERE resident_id=?";
+                PreparedStatement update = con.prepareStatement(sql);
+                update.setString(1, phone);
+                update.setInt(2, id);
+                yield update;
+            }
+            case "3" -> {
+                String email = readEmail();
+                sql = "UPDATE Resident SET email=? WHERE resident_id=?";
+                PreparedStatement update = con.prepareStatement(sql);
+                update.setString(1, email);
+                update.setInt(2, id);
+                yield update;
+            }
+            case "4" -> {
+                int apartmentId = readPositiveInt("New Apartment ID: ");
+                try (PreparedStatement check = con.prepareStatement(
+                        "SELECT apartment_id FROM Apartment WHERE apartment_id=?")) {
+                    check.setInt(1, apartmentId);
+                    try (ResultSet rs = check.executeQuery()) {
+                        if (!rs.next()) throw new RecordNotFoundException("Apartment ID " + apartmentId + " was not found.");
+                    }
+                }
+                try (PreparedStatement check = con.prepareStatement(
+                        "SELECT resident_id FROM Resident WHERE apartment_id=? AND resident_id<>?")) {
+                    check.setInt(1, apartmentId);
+                    check.setInt(2, id);
+                    try (ResultSet rs = check.executeQuery()) {
+                        if (rs.next()) throw new InvalidInputException("This apartment is already occupied. Choose another apartment.");
+                    }
+                }
+                sql = "UPDATE Resident SET apartment_id=? WHERE resident_id=?";
+                PreparedStatement update = con.prepareStatement(sql);
+                update.setInt(1, apartmentId);
+                update.setInt(2, id);
+                yield update;
+            }
+            default -> throw new InvalidInputException("Choose a number from 1 to 4.");
+        }) {
+            int updated = ps.executeUpdate();
+            if (updated == 1) System.out.println("Resident details updated successfully.");
+            else throw new RecordNotFoundException("Resident ID " + id + " does not exist.");
+        }
     }
 
     // 10. Remove resident and dependent rows atomically.
